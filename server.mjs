@@ -481,6 +481,9 @@ const createMcpServer = () => {
   return server;
 };
 
+// グローバルMCPサーバーインスタンス（全セッションで共有）
+const globalMcpServer = createMcpServer();
+
 /**
  * Expressアプリケーションのセットアップ
  */
@@ -582,9 +585,8 @@ const mcpPostHandler = async (req, res) => {
         }
       };
 
-      // MCPサーバーに接続
-      const server = createMcpServer();
-      await server.connect(transport);
+      // グローバルMCPサーバーに接続
+      await globalMcpServer.connect(transport);
       await transport.handleRequest(req, res, req.body);
       return;
     } else if (sessionId && req.body && req.body.method === 'tools/call') {
