@@ -301,9 +301,9 @@ const createMcpServer = () => {
         );
 
         // 背景画像の準備
-        let imageData;
+        let uploadedImageInfo;
         if (background_type === 'default') {
-          // デフォルト画像をダウンロードしてBase64化
+          // デフォルト画像をダウンロード
           await server.sendLoggingMessage(
             {
               level: 'info',
@@ -319,23 +319,60 @@ const createMcpServer = () => {
           }
 
           const imgBuf = await imgResp.arrayBuffer();
-          const b64 = Buffer.from(imgBuf).toString('base64');
-          const contentType = imgResp.headers.get('content-type') || 'image/jpeg';
-          imageData = `data:${contentType};base64,${b64}`;
 
           await server.sendLoggingMessage(
             {
               level: 'info',
-              data: `Default image downloaded, size: ${imageData.length} chars`,
+              data: `Default image downloaded, uploading to server...`,
+            },
+            extra.sessionId
+          );
+
+          // 画像をおもてなしQRサーバーにアップロード
+          const formData = new FormData();
+          const blob = new Blob([imgBuf], { type: 'image/jpeg' });
+          formData.append('file', blob, 'default_background.jpg');
+
+          const uploadUrl = `${BASE_API_URL}/upload/background`;
+          const uploadResp = await fetch(uploadUrl, {
+            method: 'POST',
+            body: formData,
+          });
+
+          if (!uploadResp.ok) {
+            const errorText = await uploadResp.text();
+            throw new Error(`Image upload failed: ${uploadResp.status} - ${errorText}`);
+          }
+
+          const uploadData = await uploadResp.json();
+          if (!uploadData.success) {
+            throw new Error(`Image upload error: ${JSON.stringify(uploadData)}`);
+          }
+
+          uploadedImageInfo = {
+            id: 'img_1',
+            file_name: uploadData.data.filename,
+            original_name: 'default_background.jpg',
+          };
+
+          await server.sendLoggingMessage(
+            {
+              level: 'info',
+              data: `Image uploaded successfully: ${uploadData.data.filename}`,
             },
             extra.sessionId
           );
         } else if (background_type === 'custom') {
-          // カスタム画像を使用
+          // カスタム画像を使用（既にアップロード済みと仮定）
           if (!custom_image) {
             throw new Error('custom_image is required when background_type is "custom"');
           }
-          imageData = custom_image;
+          // custom_imageがファイル名の場合
+          uploadedImageInfo = {
+            id: 'img_1',
+            file_name: custom_image,
+            original_name: custom_image,
+          };
         } else {
           throw new Error(`Invalid background_type: ${background_type}`);
         }
@@ -347,7 +384,7 @@ const createMcpServer = () => {
           audio_path: audio_path,
           settings: {
             backgroundType: 'custom',
-            customImagePreview: imageData,
+            multiple_images: [uploadedImageInfo],
           },
           use_bgm: use_bgm,
           use_subtitles: use_subtitles,
