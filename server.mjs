@@ -300,14 +300,54 @@ const createMcpServer = () => {
           extra.sessionId
         );
 
+        // 背景画像の準備
+        let imageData;
+        if (background_type === 'default') {
+          // デフォルト画像をダウンロードしてBase64化
+          await server.sendLoggingMessage(
+            {
+              level: 'info',
+              data: 'Downloading default background image...',
+            },
+            extra.sessionId
+          );
+
+          const bgUrl = 'https://omotenashiqr.com/assets/backgrounds/default_generic.jpg';
+          const imgResp = await fetch(bgUrl);
+          if (!imgResp.ok) {
+            throw new Error('Failed to download default background image');
+          }
+
+          const imgBuf = await imgResp.arrayBuffer();
+          const b64 = Buffer.from(imgBuf).toString('base64');
+          const contentType = imgResp.headers.get('content-type') || 'image/jpeg';
+          imageData = `data:${contentType};base64,${b64}`;
+
+          await server.sendLoggingMessage(
+            {
+              level: 'info',
+              data: `Default image downloaded, size: ${imageData.length} chars`,
+            },
+            extra.sessionId
+          );
+        } else if (background_type === 'custom') {
+          // カスタム画像を使用
+          if (!custom_image) {
+            throw new Error('custom_image is required when background_type is "custom"');
+          }
+          imageData = custom_image;
+        } else {
+          throw new Error(`Invalid background_type: ${background_type}`);
+        }
+
         const apiUrl = `${BASE_API_URL}/video/generate-video`;
         const requestBody = {
           session_token: OMOTENASHI_SESSION_TOKEN,
           project_id: project_id,
           audio_path: audio_path,
           settings: {
-            backgroundType: background_type,
-            ...(custom_image && { customImagePreview: custom_image }),
+            backgroundType: 'custom',
+            customImagePreview: imageData,
           },
           use_bgm: use_bgm,
           use_subtitles: use_subtitles,
