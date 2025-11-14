@@ -116,7 +116,15 @@ const createMcpServer = () => {
 
         // APIレスポンスの検証
         if (!data.success) {
-          throw new Error(`API returned error: ${JSON.stringify(data)}`);
+          // エラーの詳細を解析
+          const errorDetail = data.error || data.message || 'Unknown error';
+
+          // 503エラー（Google API一時的障害）の特別処理
+          if (typeof errorDetail === 'string' && errorDetail.includes('503')) {
+            throw new Error('Google音声合成APIが一時的に利用できません。数秒後に再試行してください。(503 Service Unavailable)');
+          }
+
+          throw new Error(`音声生成に失敗しました: ${JSON.stringify(data)}`);
         }
 
         await server.sendLoggingMessage(
@@ -155,6 +163,10 @@ const createMcpServer = () => {
           extra.sessionId
         );
 
+        // エラーの種類を判定
+        const is503Error = error.message.includes('503');
+        const isTemporary = is503Error || error.message.includes('timeout') || error.message.includes('UNAVAILABLE');
+
         return {
           content: [
             {
@@ -163,7 +175,12 @@ const createMcpServer = () => {
                 {
                   success: false,
                   error: error.message,
+                  error_type: isTemporary ? 'temporary' : 'permanent',
+                  retry_recommended: isTemporary,
                   message: '音声生成中にエラーが発生しました',
+                  troubleshooting: isTemporary
+                    ? '一時的なエラーです。数秒後に再試行してください。'
+                    : 'エラーの詳細を確認して、設定を見直してください。',
                 },
                 null,
                 2
