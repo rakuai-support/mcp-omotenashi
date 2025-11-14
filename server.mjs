@@ -355,13 +355,10 @@ const mcpDeleteHandler = async (req, res) => {
   }
 };
 
-// ルート設定
-// POST: API KEY認証必要（初期化リクエストを除く）
+// ルート設定（API KEY認証付き）
 app.post('/mcp', authenticateApiKey, mcpPostHandler);
-
-// GET/DELETE: セッションIDで認証（API KEY不要）
-app.get('/mcp', mcpGetHandler);
-app.delete('/mcp', mcpDeleteHandler);
+app.get('/mcp', authenticateApiKey, mcpGetHandler);
+app.delete('/mcp', authenticateApiKey, mcpDeleteHandler);
 
 // ヘルスチェックエンドポイント
 app.get('/health', (req, res) => {
