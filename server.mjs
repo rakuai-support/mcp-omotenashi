@@ -144,8 +144,10 @@ const createMcpServer = () => {
                 {
                   success: true,
                   project_id: data.data?.project_id,
+                  audio_path: data.data?.audio_path,
                   status: data.data?.status,
                   message: '音声生成が正常に開始されました',
+                  note: '動画を生成するには、generate_videoツールを使用してください',
                   api_response: data,
                 },
                 null,
@@ -178,6 +180,153 @@ const createMcpServer = () => {
                   error_type: isTemporary ? 'temporary' : 'permanent',
                   retry_recommended: isTemporary,
                   message: '音声生成中にエラーが発生しました',
+                  troubleshooting: isTemporary
+                    ? '一時的なエラーです。数秒後に再試行してください。'
+                    : 'エラーの詳細を確認して、設定を見直してください。',
+                },
+                null,
+                2
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // 動画生成ツール
+  server.registerTool(
+    'generate_video',
+    {
+      title: '動画生成ツール',
+      description: '音声から動画を生成します（おもてなしQR動画生成API）',
+      inputSchema: {
+        project_id: z.string().describe('プロジェクトID（音声生成で取得したID）'),
+        audio_path: z.string().describe('音声ファイルパス（音声生成で取得したパス）'),
+        background_type: z
+          .enum(['default', 'custom'])
+          .default('default')
+          .describe('背景タイプ: default（デフォルト背景）またはcustom（カスタム背景）'),
+        custom_image: z.string().optional().describe('カスタム背景画像（Base64エンコード、background_type=customの場合のみ）'),
+        use_bgm: z.boolean().default(false).describe('BGMを使用するか'),
+        use_subtitles: z.boolean().default(true).describe('字幕を表示するか'),
+        use_vertical_video: z.boolean().default(false).describe('縦動画（1080x1920）にするか'),
+      },
+    },
+    async ({ project_id, audio_path, background_type, custom_image, use_bgm, use_subtitles, use_vertical_video }, extra) => {
+      try {
+        await server.sendLoggingMessage(
+          {
+            level: 'info',
+            data: `Generating video for project: ${project_id}`,
+          },
+          extra.sessionId
+        );
+
+        const apiUrl = `${BASE_API_URL}/api/v2/video/generate-video`;
+        const requestBody = {
+          session_token: OMOTENASHI_SESSION_TOKEN,
+          project_id: project_id,
+          audio_path: audio_path,
+          settings: {
+            backgroundType: background_type,
+            ...(custom_image && { customImagePreview: custom_image }),
+          },
+          use_bgm: use_bgm,
+          use_subtitles: use_subtitles,
+          use_vertical_video: use_vertical_video,
+        };
+
+        await server.sendLoggingMessage(
+          {
+            level: 'debug',
+            data: `Video generation request: ${JSON.stringify(requestBody, null, 2)}`,
+          },
+          extra.sessionId
+        );
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`API request failed: ${response.status} ${response.statusText} - ${errorText}`);
+        }
+
+        const data = await response.json();
+
+        // APIレスポンスの検証
+        if (!data.success) {
+          // エラーの詳細を解析
+          const errorDetail = data.error || data.message || 'Unknown error';
+
+          // 503エラー（Google API一時的障害）の特別処理
+          if (typeof errorDetail === 'string' && errorDetail.includes('503')) {
+            throw new Error('Google音声合成APIが一時的に利用できません。数秒後に再試行してください。(503 Service Unavailable)');
+          }
+
+          throw new Error(`動画生成に失敗しました: ${JSON.stringify(data)}`);
+        }
+
+        await server.sendLoggingMessage(
+          {
+            level: 'info',
+            data: `Video generation completed. Project ID: ${data.data?.project_id || 'N/A'}`,
+          },
+          extra.sessionId
+        );
+
+        // MCPクライアントに返すレスポンス
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: true,
+                  project_id: data.data?.project_id,
+                  video_path: data.data?.video_path,
+                  video_url: data.data?.video_url,
+                  status: data.data?.status,
+                  message: '動画生成が正常に完了しました',
+                  api_response: data,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        await server.sendLoggingMessage(
+          {
+            level: 'error',
+            data: `Error in generate_video: ${error.message}`,
+          },
+          extra.sessionId
+        );
+
+        // エラーの種類を判定
+        const is503Error = error.message.includes('503');
+        const isTemporary = is503Error || error.message.includes('timeout') || error.message.includes('UNAVAILABLE');
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: error.message,
+                  error_type: isTemporary ? 'temporary' : 'permanent',
+                  retry_recommended: isTemporary,
+                  message: '動画生成中にエラーが発生しました',
                   troubleshooting: isTemporary
                     ? '一時的なエラーです。数秒後に再試行してください。'
                     : 'エラーの詳細を確認して、設定を見直してください。',
