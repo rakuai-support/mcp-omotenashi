@@ -361,7 +361,7 @@ const createMcpServer = () => {
         // ポーリングで動画完成を待つ（最大5分）
         let videoUrl = null;
         let shortUrl = null;
-        const statusUrl = `${BASE_API_URL}/api/v2/video/project-status/${project_id}`;
+        const statusUrl = `${BASE_API_URL}/video/project-status/${project_id}`;
 
         for (let i = 1; i <= 300; i++) {
           const statusResp = await fetch(statusUrl);
