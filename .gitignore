@@ -1,6 +1,36 @@
-node_modules/
+# 環境変数ファイル（機密情報を含む）
 .env
-package-lock.json
+.env.local
+.env.*.local
+
+# Node.js
 node_modules/
-.env
-package-lock.json
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ログファイル
+*.log
+logs/
+
+# PM2
+.pm2/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# テスト
+coverage/
+.nyc_output/
+
+# ビルド出力
+dist/
+build/
