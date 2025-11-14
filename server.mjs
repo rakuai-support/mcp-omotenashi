@@ -58,12 +58,12 @@ const createMcpServer = () => {
     {
       title: '音声生成ツール',
       description: 'テキストから音声を生成します（おもてなしQR音声生成API）',
-      inputSchema: {
+      inputSchema: z.object({
         content: z.string().describe('音声化するテキスト内容'),
         language: z.enum(['ja', 'en', 'zh', 'ko']).default('ja').describe('言語 (ja, en, zh, ko)'),
         voice_speaker: z.string().default('Orus').describe('音声スピーカー名（例: Orus）'),
         voice_speed: z.number().min(0.5).max(2.0).default(1.0).describe('音声速度 (0.5-2.0)'),
-      },
+      }),
     },
     async ({ content, language, voice_speaker, voice_speed }, extra) => {
       try {
@@ -98,6 +98,11 @@ const createMcpServer = () => {
           extra.sessionId
         );
 
+        // リクエスト詳細をログ出力
+        console.log('[DEBUG] API Request:');
+        console.log('  URL:', apiUrl);
+        console.log('  Body:', JSON.stringify(requestBody, null, 2));
+
         // 既存APIを呼び出し
         const response = await fetch(apiUrl, {
           method: 'POST',
@@ -109,6 +114,10 @@ const createMcpServer = () => {
 
         if (!response.ok) {
           const errorText = await response.text();
+          console.log('[ERROR] API Response:');
+          console.log('  Status:', response.status);
+          console.log('  StatusText:', response.statusText);
+          console.log('  Body:', errorText);
           throw new Error(`API request failed: ${response.status} ${response.statusText} - ${errorText}`);
         }
 
@@ -119,10 +128,74 @@ const createMcpServer = () => {
           throw new Error(`API returned error: ${JSON.stringify(data)}`);
         }
 
+        // プロジェクトIDを取得
+        const projectId = data.data?.project_id;
+        if (!projectId) {
+          throw new Error('No project_id in response');
+        }
+
         await server.sendLoggingMessage(
           {
             level: 'info',
-            data: `Audio generation completed. Project ID: ${data.data?.project_id || 'N/A'}`,
+            data: `Audio generation started. Project ID: ${projectId}`,
+          },
+          extra.sessionId
+        );
+
+        // 🆕 音声ファイル完成を待つ（ステータスAPIポーリング）
+        const maxAttempts = 60; // 最大60秒
+        const pollInterval = 1000; // 1秒ごと
+        let audioFileUrl = null;
+        let finalStatus = null;
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+          // ステータスAPIを呼び出し
+          const statusUrl = `${BASE_API_URL}/video/project-status/${projectId}`;
+          const statusResponse = await fetch(statusUrl, {
+            method: 'GET',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          });
+
+          if (statusResponse.ok) {
+            const statusData = await statusResponse.json();
+            
+            if (statusData.success && statusData.data) {
+              const status = statusData.data.status;
+              finalStatus = status;
+
+              // 音声完成を確認
+              if (status === 'audio_completed' && statusData.data.files?.audio) {
+                const audioPath = statusData.data.files.audio;
+                audioFileUrl = `https://omotenashiqr.com/${audioPath}`;
+                
+                await server.sendLoggingMessage(
+                  {
+                    level: 'info',
+                    data: `Audio completed after ${attempt} seconds: ${audioFileUrl}`,
+                  },
+                  extra.sessionId
+                );
+                break;
+              }
+            }
+          }
+
+          // まだ完成していない場合は待つ
+          if (attempt < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+          }
+        }
+
+        if (!audioFileUrl) {
+          throw new Error(`Audio file not ready after ${maxAttempts} seconds (status: ${finalStatus})`);
+        }
+
+        await server.sendLoggingMessage(
+          {
+            level: 'info',
+            data: `Audio generation completed. Project ID: ${projectId}`,
           },
           extra.sessionId
         );
@@ -135,10 +208,10 @@ const createMcpServer = () => {
               text: JSON.stringify(
                 {
                   success: true,
-                  project_id: data.data?.project_id,
-                  status: data.data?.status,
-                  message: '音声生成が正常に開始されました',
-                  api_response: data,
+                  project_id: projectId,
+                  status: 'audio_completed',
+                  audio_url: audioFileUrl,
+                  message: '音声生成が完了しました',
                 },
                 null,
                 2
@@ -236,6 +309,10 @@ const authenticateApiKey = (req, res, next) => {
  * MCP POSTエンドポイント
  */
 const mcpPostHandler = async (req, res) => {
+  // デバッグ: リクエスト詳細をログ出力
+  console.log('[DEBUG] POST /mcp - Headers:', JSON.stringify(req.headers));
+  console.log('[DEBUG] POST /mcp - Body:', JSON.stringify(req.body));
+
   const sessionId = req.headers['mcp-session-id'];
 
   if (sessionId) {
@@ -281,8 +358,39 @@ const mcpPostHandler = async (req, res) => {
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       return;
+    } else if (sessionId && req.body && req.body.method === 'tools/call') {
+      // セッションIDはあるが、サーバーが知らない場合（サーバー再起動後など）
+      // 新しいトランスポートを自動作成してセッションを再確立
+      console.log('[MCP] Recreating lost transport for session: ' + sessionId);
+      console.log('[MCP] This typically happens after server restart');
+      
+      const eventStore = new InMemoryEventStore();
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => sessionId,  // 既存のセッションIDを再利用
+        eventStore,
+        onsessioninitialized: (sid) => {
+          console.log('[MCP] Session re-initialized with ID: ' + sid);
+          transports[sid] = transport;
+        },
+      });
+
+      // クローズ時のクリーンアップ
+      transport.onclose = () => {
+        if (transports[sessionId]) {
+          console.log('[MCP] Transport closed for session ' + sessionId);
+          delete transports[sessionId];
+        }
+      };
+
+      // MCPサーバーに接続
+      const server = createMcpServer();
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      return;
     } else {
       // 無効なリクエスト
+      console.log('[ERROR] Invalid request - No session ID and not an initialize request');
+      console.log('[ERROR] Request body:', JSON.stringify(req.body));
       return res.status(400).json({
         jsonrpc: '2.0',
         error: {
