@@ -634,7 +634,6 @@ const mcpPostHandler = async (req, res) => {
       };
 
       // MCPサーバーに接続
-      const server = createMcpServer();
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       return;
