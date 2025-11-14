@@ -154,7 +154,9 @@ const createMcpServer = () => {
         const maxAttempts = 60; // 最大60秒
         const pollInterval = 1000; // 1秒ごと
         let audioFileUrl = null;
+        let audioPath = null;
         let finalStatus = null;
+        let completedStatusData = null;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           // ステータスAPIを呼び出し
@@ -168,16 +170,17 @@ const createMcpServer = () => {
 
           if (statusResponse.ok) {
             const statusData = await statusResponse.json();
-            
+
             if (statusData.success && statusData.data) {
               const status = statusData.data.status;
               finalStatus = status;
 
               // 音声完成を確認
               if (status === 'audio_completed' && statusData.data.files?.audio) {
-                const audioPath = statusData.data.files.audio;
+                audioPath = statusData.data.files.audio;
                 audioFileUrl = `https://omotenashiqr.com/${audioPath}`;
-                
+                completedStatusData = statusData;
+
                 await server.sendLoggingMessage(
                   {
                     level: 'info',
@@ -203,7 +206,7 @@ const createMcpServer = () => {
         await server.sendLoggingMessage(
           {
             level: 'info',
-            data: `Audio generation completed. Project ID: ${projectId}`,
+            data: `Audio generation completed. Project ID: ${projectId}, Audio URL: ${audioFileUrl}`,
           },
           extra.sessionId
         );
@@ -216,12 +219,12 @@ const createMcpServer = () => {
               text: JSON.stringify(
                 {
                   success: true,
-                  project_id: data.data?.project_id,
-                  audio_path: data.data?.audio_path,
-                  status: data.data?.status,
-                  message: '音声生成が正常に開始されました',
-                  note: '動画を生成するには、generate_videoツールを使用してください',
-                  api_response: data,
+                  project_id: projectId,
+                  audio_path: audioPath,
+                  audio_url: audioFileUrl,
+                  status: 'audio_completed',
+                  message: '音声生成が正常に完了しました',
+                  note: '動画を生成するには、generate_videoツールでこのaudio_pathを使用してください',
                 },
                 null,
                 2
