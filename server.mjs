@@ -350,7 +350,38 @@ const createMcpServer = () => {
         await server.sendLoggingMessage(
           {
             level: 'info',
-            data: `Video generation completed. Project ID: ${data.data?.project_id || 'N/A'}`,
+            data: `Video generation started. Polling for completion...`,
+          },
+          extra.sessionId
+        );
+
+        // ポーリングで動画完成を待つ（最大5分）
+        let videoUrl = null;
+        let shortUrl = null;
+        const statusUrl = `${BASE_API_URL}/api/v2/video/project-status/${project_id}`;
+
+        for (let i = 1; i <= 300; i++) {
+          const statusResp = await fetch(statusUrl);
+          if (statusResp.ok) {
+            const statusData = await statusResp.json();
+            if (statusData.success && statusData.data && statusData.data.status === 'video_completed' && statusData.data.files?.video) {
+              videoUrl = `https://omotenashiqr.com/${statusData.data.files.video}`;
+              shortUrl = statusData.data.short_url || null;
+              break;
+            }
+          }
+          // 1秒待機（最後のループ以外）
+          if (i < 300) await new Promise(r => setTimeout(r, 1000));
+        }
+
+        if (!videoUrl) {
+          throw new Error('動画生成がタイムアウトしました（5分経過）。プロジェクトステータスを確認してください。');
+        }
+
+        await server.sendLoggingMessage(
+          {
+            level: 'info',
+            data: `Video generation completed. Video URL: ${videoUrl}`,
           },
           extra.sessionId
         );
@@ -363,12 +394,10 @@ const createMcpServer = () => {
               text: JSON.stringify(
                 {
                   success: true,
-                  project_id: data.data?.project_id,
-                  video_path: data.data?.video_path,
-                  video_url: data.data?.video_url,
-                  status: data.data?.status,
+                  project_id: project_id,
+                  video_url: videoUrl,
+                  short_url: shortUrl,
                   message: '動画生成が正常に完了しました',
-                  api_response: data,
                 },
                 null,
                 2
@@ -410,69 +439,6 @@ const createMcpServer = () => {
             },
           ],
           isError: true,
-        };
-      }
-    }
-  );
-
-
-  // 動画生成ツール
-  server.registerTool(
-    "generate_video",
-    {
-      title: "動画生成ツール",
-      description: "音声ファイルから背景画像付き動画を生成します",
-      inputSchema: z.object({
-        project_id: z.string().describe("音声生成で取得したプロジェクトID"),
-        background_image: z.enum(["1", "2", "3", "4", "5"]).default("1").describe("背景画像番号（1-5）"),
-      }),
-    },
-    async ({ project_id, background_image }, extra) => {
-      try {
-        await server.sendLoggingMessage({ level: "info", data: "Starting video for: " + project_id }, extra.sessionId);
-        const pUrl = BASE_API_URL + "/video/project-status/" + project_id;
-        const pResp = await fetch(pUrl);
-        if (!pResp.ok) throw new Error("Project not found");
-        const pData = await pResp.json();
-        if (!pData.success) throw new Error("Invalid project");
-        const audioPath = pData.data.files?.audio;
-        if (!audioPath) throw new Error("No audio file");
-        const bgUrl = "https://omotenashiqr.com/assets/backgrounds/default_generic.jpg";
-        const imgResp = await fetch(bgUrl);
-        if (!imgResp.ok) throw new Error("Failed to download bg");
-        const imgBuf = await imgResp.arrayBuffer();
-        const b64 = Buffer.from(imgBuf).toString("base64");
-        const ct = imgResp.headers.get("content-type") || "image/jpeg";
-        const imgData = "data:" + ct + ";base64," + b64;
-        const vUrl = BASE_API_URL + "/video/generate-video";
-        const reqBody = { session_token: OMOTENASHI_SESSION_TOKEN, project_id: project_id, audio_path: audioPath, settings: { backgroundType: "custom", customImagePreview: imgData, language: pData.data.selected_language || "ja" }, use_bgm: false, use_subtitles: false, use_vertical_video: false }; await server.sendLoggingMessage({ level: "info", data: "Image data size: " + imgData.length + " chars" }, extra.sessionId); const vResp = await fetch(vUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_token: OMOTENASHI_SESSION_TOKEN, project_id: project_id, audio_path: audioPath, settings: { backgroundType: "custom", customImagePreview: imgData, language: pData.data.selected_language || "ja" }, use_bgm: false, use_subtitles: false, use_vertical_video: false }) });
-        if (!vResp.ok) throw new Error("Video API failed");
-        const vData = await vResp.json();
-        if (!vData.success) throw new Error("Video API error");
-        await server.sendLoggingMessage({ level: "info", data: "Polling for video completion..." }, extra.sessionId);
-        let videoUrl = null;
-        let sUrl = null;
-        for (let i = 1; i <= 300; i++) {
-          const sResp = await fetch(pUrl);
-          if (sResp.ok) {
-            const sData = await sResp.json();
-            if (sData.success && sData.data && sData.data.status === "video_completed" && sData.data.files?.video) {
-              videoUrl = "https://omotenashiqr.com/" + sData.data.files.video;
-              sUrl = sData.data.short_url || null;
-              break;
-            }
-          }
-          if (i < 300) await new Promise(r => setTimeout(r, 1000));
-        }
-        if (!videoUrl) throw new Error("Video not ready");
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, project_id: project_id, video_url: videoUrl, short_url: sUrl, message: "動画生成完了" }, null, 2) }] };
-      } catch (error) {
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({ success: false, error: error.message }, null, 2)
-          }],
-          isError: true
         };
       }
     }
