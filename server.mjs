@@ -76,7 +76,7 @@ const createMcpServer = () => {
         );
 
         // 既存APIのエンドポイント
-        const apiUrl = `${BASE_API_URL}/api/v2/video/generate-audio`;
+        const apiUrl = `${BASE_API_URL}/video/generate-audio`;
 
         // APIリクエストボディ
         const requestBody = {
