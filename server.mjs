@@ -355,10 +355,10 @@ const mcpDeleteHandler = async (req, res) => {
   }
 };
 
-// ルート設定（API KEY認証付き）
-app.post('/mcp', authenticateApiKey, mcpPostHandler);
-app.get('/mcp', authenticateApiKey, mcpGetHandler);
-app.delete('/mcp', authenticateApiKey, mcpDeleteHandler);
+// ルート設定（認証なし - ChatGPT Desktop App互換）
+app.post('/mcp', mcpPostHandler);
+app.get('/mcp', mcpGetHandler);
+app.delete('/mcp', mcpDeleteHandler);
 
 // ヘルスチェックエンドポイント
 app.get('/health', (req, res) => {
