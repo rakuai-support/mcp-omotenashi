@@ -300,7 +300,7 @@ const createMcpServer = () => {
           extra.sessionId
         );
 
-        const apiUrl = `${BASE_API_URL}/api/v2/video/generate-video`;
+        const apiUrl = `${BASE_API_URL}/video/generate-video`;
         const requestBody = {
           session_token: OMOTENASHI_SESSION_TOKEN,
           project_id: project_id,
