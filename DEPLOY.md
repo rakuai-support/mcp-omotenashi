@@ -2,6 +2,14 @@
 
 本番環境（Ubuntu VPS `mcp.omotenashiqr.com`）へのデプロイ手順です。
 
+## 最新の機能
+
+- **3つのMCPツール**: `generate_audio`, `generate_video`, `generate_complete_video`
+- **15言語対応**: 日本語、英語、中国語、韓国語、タイ語など
+- **QRコード生成**: テキストから動画・QRコードまで一括生成
+- **503エラーハンドリング**: Google API一時的障害の適切な処理
+- **グローバルMCPサーバー**: 全セッションで共有される単一インスタンス
+
 ## 前提条件
 
 - Ubuntu VPS へのSSHアクセス
@@ -38,18 +46,23 @@ nano .env
 以下の内容を入力：
 
 ```env
-# MCP Server API Key (強力なランダム文字列を生成)
+# MCP Server API Key（generate_complete_videoで使用）
 MCP_API_KEY=生成したAPIキー
 
-# おもてなしQR 管理者セッショントークン
+# おもてなしQR 管理者セッショントークン（既存APIへのリクエスト用）
 OMOTENASHI_SESSION_TOKEN=実際のセッショントークン
 
 # 既存APIのベースURL
 BASE_API_URL=https://omotenashiqr.com
 
-# MCPサーバーのポート番号
+# MCPサーバーのポート番号（デフォルト: 8001）
 MCP_PORT=8001
 ```
+
+**注意:**
+- `MCP_API_KEY`は`generate_complete_video`ツールで使用されます
+- `OMOTENASHI_SESSION_TOKEN`は`generate_audio`と`generate_video`で使用されます
+- MCPクライアントからの接続は認証不要（ChatGPT Desktop App互換）
 
 **API KEYの生成例:**
 
@@ -181,6 +194,8 @@ sudo ufw status
 
 ## 9. 動作確認
 
+### 基本動作確認
+
 ```bash
 # ヘルスチェック（HTTP）
 curl http://mcp.omotenashiqr.com/health
@@ -206,6 +221,15 @@ curl -X POST https://mcp.omotenashiqr.com/mcp \
     "id": 1
   }'
 ```
+
+### 3つのツールの動作確認
+
+詳細なツールテスト方法はREADME.mdの「ツール仕様」セクションを参照してください。
+
+**利用可能なツール:**
+1. `generate_audio` - テキストから音声を生成（4言語対応）
+2. `generate_video` - 音声から動画を生成
+3. `generate_complete_video` - テキストから動画・QRコードまで一括生成（15言語対応）
 
 ## 10. モニタリング
 
@@ -302,6 +326,45 @@ sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
 ```
+
+### 503エラー（Google API一時的障害）
+
+Google音声合成APIが一時的に利用できない場合に発生します：
+
+```bash
+# サーバーログを確認
+pm2 logs mcp-omotenashi --lines 100 | grep "503"
+
+# 数秒〜数分後に再試行してください
+# 頻発する場合は、Google APIの状態を確認してください
+```
+
+**対処法:**
+1. 一時的なエラーなので、数秒後に再試行
+2. 頻発する場合は、Google APIのステータスページを確認
+3. エラーメッセージには「retry_recommended: true」が含まれます
+
+### 動画生成のタイムアウト
+
+各ツールには適切なタイムアウトが設定されています：
+
+- `generate_audio`: 最大60秒
+- `generate_video`: 最大300秒（5分）
+- `generate_complete_video`: 最大120秒
+
+```bash
+# プロジェクトステータスAPIで状態を確認
+curl https://omotenashiqr.com/video/project-status/{project_id}
+
+# タイムアウト後も処理が継続している可能性があります
+# サーバーログで詳細を確認
+pm2 logs mcp-omotenashi --lines 50
+```
+
+**対処法:**
+1. `generate_complete_video`がタイムアウトした場合、`generate_audio`と`generate_video`を個別に実行
+2. Nginxのタイムアウト設定を確認（600秒推奨）
+3. 長い動画の場合は、処理に時間がかかることがあります
 
 ## セキュリティ
 
