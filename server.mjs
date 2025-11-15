@@ -8,6 +8,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js';
+import fs from 'fs';
+import path from 'path';
 
 // 環境変数の読み込み
 dotenv.config();
@@ -125,7 +127,15 @@ const createMcpServer = () => {
 
         // APIレスポンスの検証
         if (!data.success) {
-          throw new Error(`API returned error: ${JSON.stringify(data)}`);
+          // エラーの詳細を解析
+          const errorDetail = data.error || data.message || 'Unknown error';
+
+          // 503エラー（Google API一時的障害）の特別処理
+          if (typeof errorDetail === 'string' && errorDetail.includes('503')) {
+            throw new Error('Google音声合成APIが一時的に利用できません。数秒後に再試行してください。(503 Service Unavailable)');
+          }
+
+          throw new Error(`音声生成に失敗しました: ${JSON.stringify(data)}`);
         }
 
         // プロジェクトIDを取得
@@ -146,7 +156,9 @@ const createMcpServer = () => {
         const maxAttempts = 60; // 最大60秒
         const pollInterval = 1000; // 1秒ごと
         let audioFileUrl = null;
+        let audioPath = null;
         let finalStatus = null;
+        let completedStatusData = null;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           // ステータスAPIを呼び出し
@@ -160,16 +172,17 @@ const createMcpServer = () => {
 
           if (statusResponse.ok) {
             const statusData = await statusResponse.json();
-            
+
             if (statusData.success && statusData.data) {
               const status = statusData.data.status;
               finalStatus = status;
 
               // 音声完成を確認
-              if (status === 'audio_completed' && statusData.data.files?.audio) {
-                const audioPath = statusData.data.files.audio;
+              if ((status === 'audio_completed' || status === 'completed') && statusData.data.files?.audio) {
+                audioPath = statusData.data.files.audio;
                 audioFileUrl = `https://omotenashiqr.com/${audioPath}`;
-                
+                completedStatusData = statusData;
+
                 await server.sendLoggingMessage(
                   {
                     level: 'info',
@@ -195,7 +208,7 @@ const createMcpServer = () => {
         await server.sendLoggingMessage(
           {
             level: 'info',
-            data: `Audio generation completed. Project ID: ${projectId}`,
+            data: `Audio generation completed. Project ID: ${projectId}, Audio URL: ${audioFileUrl}`,
           },
           extra.sessionId
         );
@@ -209,9 +222,11 @@ const createMcpServer = () => {
                 {
                   success: true,
                   project_id: projectId,
-                  status: 'audio_completed',
+                  audio_path: audioPath,
                   audio_url: audioFileUrl,
-                  message: '音声生成が完了しました',
+                  status: 'audio_completed',
+                  message: '音声生成が正常に完了しました',
+                  note: '動画を生成するには、generate_videoツールでこのaudio_pathを使用してください',
                 },
                 null,
                 2
@@ -228,6 +243,10 @@ const createMcpServer = () => {
           extra.sessionId
         );
 
+        // エラーの種類を判定
+        const is503Error = error.message.includes('503');
+        const isTemporary = is503Error || error.message.includes('timeout') || error.message.includes('UNAVAILABLE');
+
         return {
           content: [
             {
@@ -236,7 +255,12 @@ const createMcpServer = () => {
                 {
                   success: false,
                   error: error.message,
+                  error_type: isTemporary ? 'temporary' : 'permanent',
+                  retry_recommended: isTemporary,
                   message: '音声生成中にエラーが発生しました',
+                  troubleshooting: isTemporary
+                    ? '一時的なエラーです。数秒後に再試行してください。'
+                    : 'エラーの詳細を確認して、設定を見直してください。',
                 },
                 null,
                 2
@@ -249,64 +273,376 @@ const createMcpServer = () => {
     }
   );
 
-
   // 動画生成ツール
   server.registerTool(
-    "generate_video",
+    'generate_video',
     {
-      title: "動画生成ツール",
-      description: "音声ファイルから背景画像付き動画を生成します",
-      inputSchema: z.object({
-        project_id: z.string().describe("音声生成で取得したプロジェクトID"),
-        background_image: z.enum(["1", "2", "3", "4", "5"]).default("1").describe("背景画像番号（1-5）"),
-      }),
+      title: '動画生成ツール',
+      description: '音声から動画を生成します（おもてなしQR動画生成API）',
+      inputSchema: {
+        project_id: z.string().describe('プロジェクトID（音声生成で取得したID）'),
+        audio_path: z.string().describe('音声ファイルパス（音声生成で取得したパス）'),
+        background_type: z
+          .enum(['default', 'custom'])
+          .default('default')
+          .describe('背景タイプ: default（デフォルト背景）またはcustom（カスタム背景）'),
+        custom_image: z.string().optional().describe('カスタム背景画像（Base64エンコード、background_type=customの場合のみ）'),
+        use_bgm: z.boolean().default(false).describe('BGMを使用するか'),
+        use_subtitles: z.boolean().default(true).describe('字幕を表示するか'),
+        use_vertical_video: z.boolean().default(false).describe('縦動画（1080x1920）にするか'),
+      },
     },
-    async ({ project_id, background_image }, extra) => {
+    async ({ project_id, audio_path, background_type, custom_image, use_bgm, use_subtitles, use_vertical_video }, extra) => {
       try {
-        await server.sendLoggingMessage({ level: "info", data: "Starting video for: " + project_id }, extra.sessionId);
-        const pUrl = BASE_API_URL + "/video/project-status/" + project_id;
-        const pResp = await fetch(pUrl);
-        if (!pResp.ok) throw new Error("Project not found");
-        const pData = await pResp.json();
-        if (!pData.success) throw new Error("Invalid project");
-        const audioPath = pData.data.files?.audio;
-        if (!audioPath) throw new Error("No audio file");
-        const bgUrl = "https://omotenashiqr.com/assets/backgrounds/default_generic.jpg";
-        const imgResp = await fetch(bgUrl);
-        if (!imgResp.ok) throw new Error("Failed to download bg");
-        const imgBuf = await imgResp.arrayBuffer();
-        const b64 = Buffer.from(imgBuf).toString("base64");
-        const ct = imgResp.headers.get("content-type") || "image/jpeg";
-        const imgData = "data:" + ct + ";base64," + b64;
-        const vUrl = BASE_API_URL + "/video/generate-video";
-        const reqBody = { session_token: OMOTENASHI_SESSION_TOKEN, project_id: project_id, audio_path: audioPath, settings: { backgroundType: "custom", customImagePreview: imgData, language: pData.data.selected_language || "ja" }, use_bgm: false, use_subtitles: false, use_vertical_video: false }; await server.sendLoggingMessage({ level: "info", data: "Image data size: " + imgData.length + " chars" }, extra.sessionId); const vResp = await fetch(vUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_token: OMOTENASHI_SESSION_TOKEN, project_id: project_id, audio_path: audioPath, settings: { backgroundType: "custom", customImagePreview: imgData, language: pData.data.selected_language || "ja" }, use_bgm: false, use_subtitles: false, use_vertical_video: false }) });
-        if (!vResp.ok) throw new Error("Video API failed");
-        const vData = await vResp.json();
-        if (!vData.success) throw new Error("Video API error");
-        await server.sendLoggingMessage({ level: "info", data: "Polling for video completion..." }, extra.sessionId);
+        await server.sendLoggingMessage(
+          {
+            level: 'info',
+            data: `Generating video for project: ${project_id}`,
+          },
+          extra.sessionId
+        );
+
+        // 背景画像の準備
+        let uploadedImageInfo;
+        if (background_type === 'default') {
+          // デフォルト画像をダウンロード
+          await server.sendLoggingMessage(
+            {
+              level: 'info',
+              data: 'Downloading default background image...',
+            },
+            extra.sessionId
+          );
+
+          const bgUrl = 'https://omotenashiqr.com/assets/backgrounds/default_generic.jpg';
+          const imgResp = await fetch(bgUrl);
+          if (!imgResp.ok) {
+            throw new Error('Failed to download default background image');
+          }
+
+          const imgBuf = await imgResp.arrayBuffer();
+
+          // TODO: 画像保存の恒久的な解決策が必要
+          // 現在の実装: MCPサーバーから直接プロジェクトフォルダに保存
+          // 将来の改善: 本体側のAPI拡張（project_id対応のアップロードエンドポイント）
+          // 課題: uploads/フォルダとproject/フォルダの二重管理
+          
+          await server.sendLoggingMessage(
+            {
+              level: 'info',
+              data: `Saving image directly to project folder...`,
+            },
+            extra.sessionId
+          );
+
+          // プロジェクトフォルダに直接保存
+          const timestamp = Math.floor(Date.now() / 1000);
+          const filename = `${timestamp}_default_background.jpg`;
+          const projectPath = `/home/ubuntu/omotenashiqr_production/outputs/${project_id}`;
+          const filepath = `${projectPath}/${filename}`;
+          
+          // プロジェクトフォルダが存在することを確認
+          if (!fs.existsSync(projectPath)) {
+            throw new Error(`Project directory does not exist: ${projectPath}`);
+          }
+
+          // バッファをファイルに書き込み
+          fs.writeFileSync(filepath, Buffer.from(imgBuf));
+
+          uploadedImageInfo = {
+            id: 'img_1',
+            file_name: filename,
+            original_name: 'default_background.jpg',
+          };
+
+          await server.sendLoggingMessage(
+            {
+              level: 'info',
+              data: `Image saved to project folder: ${filename}`,
+            },
+            extra.sessionId
+          );
+        } else if (background_type === 'custom') {
+          // カスタム画像を使用（既にアップロード済みと仮定）
+          if (!custom_image) {
+            throw new Error('custom_image is required when background_type is "custom"');
+          }
+          // custom_imageがファイル名の場合
+          uploadedImageInfo = {
+            id: 'img_1',
+            file_name: custom_image,
+            original_name: custom_image,
+          };
+        } else {
+          throw new Error(`Invalid background_type: ${background_type}`);
+        }
+
+        const apiUrl = `${BASE_API_URL}/video/generate-video`;
+        const requestBody = {
+          session_token: OMOTENASHI_SESSION_TOKEN,
+          project_id: project_id,
+          audio_path: audio_path,
+          settings: {
+            backgroundType: 'custom',
+            multiple_images: [uploadedImageInfo],
+          },
+          use_bgm: use_bgm,
+          use_subtitles: use_subtitles,
+          use_vertical_video: use_vertical_video,
+        };
+
+        await server.sendLoggingMessage(
+          {
+            level: 'debug',
+            data: `Video generation request: ${JSON.stringify(requestBody, null, 2)}`,
+          },
+          extra.sessionId
+        );
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          throw new Error(`API request failed: ${response.status} ${response.statusText} - ${errorText}`);
+        }
+
+        const data = await response.json();
+
+        // APIレスポンスの検証
+        if (!data.success) {
+          // エラーの詳細を解析
+          const errorDetail = data.error || data.message || 'Unknown error';
+
+          // 503エラー（Google API一時的障害）の特別処理
+          if (typeof errorDetail === 'string' && errorDetail.includes('503')) {
+            throw new Error('Google音声合成APIが一時的に利用できません。数秒後に再試行してください。(503 Service Unavailable)');
+          }
+
+          throw new Error(`動画生成に失敗しました: ${JSON.stringify(data)}`);
+        }
+
+        await server.sendLoggingMessage(
+          {
+            level: 'info',
+            data: `Video generation started. Polling for completion...`,
+          },
+          extra.sessionId
+        );
+
+        // ポーリングで動画完成を待つ（最大5分）
         let videoUrl = null;
-        let sUrl = null;
+        let shortUrl = null;
+        const statusUrl = `${BASE_API_URL}/video/project-status/${project_id}`;
+
         for (let i = 1; i <= 300; i++) {
-          const sResp = await fetch(pUrl);
-          if (sResp.ok) {
-            const sData = await sResp.json();
-            if (sData.success && sData.data && sData.data.status === "video_completed" && sData.data.files?.video) {
-              videoUrl = "https://omotenashiqr.com/" + sData.data.files.video;
-              sUrl = sData.data.short_url || null;
+          const statusResp = await fetch(statusUrl);
+          if (statusResp.ok) {
+            const statusData = await statusResp.json();
+            if (statusData.success && statusData.data && statusData.data.status === 'completed' && statusData.data.files?.video) {
+              videoUrl = `https://omotenashiqr.com/${statusData.data.files.video}`;
+              shortUrl = statusData.data.short_url || null;
               break;
             }
           }
+          // 1秒待機（最後のループ以外）
           if (i < 300) await new Promise(r => setTimeout(r, 1000));
         }
-        if (!videoUrl) throw new Error("Video not ready");
-        return { content: [{ type: "text", text: JSON.stringify({ success: true, project_id: project_id, video_url: videoUrl, short_url: sUrl, message: "動画生成完了" }, null, 2) }] };
-      } catch (error) {
+
+        if (!videoUrl) {
+          throw new Error('動画生成がタイムアウトしました（5分経過）。プロジェクトステータスを確認してください。');
+        }
+
+        await server.sendLoggingMessage(
+          {
+            level: 'info',
+            data: `Video generation completed. Video URL: ${videoUrl}`,
+          },
+          extra.sessionId
+        );
+
+        // MCPクライアントに返すレスポンス
         return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({ success: false, error: error.message }, null, 2)
-          }],
-          isError: true
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: true,
+                  project_id: project_id,
+                  video_url: videoUrl,
+                  short_url: shortUrl,
+                  message: '動画生成が正常に完了しました',
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        await server.sendLoggingMessage(
+          {
+            level: 'error',
+            data: `Error in generate_video: ${error.message}`,
+          },
+          extra.sessionId
+        );
+
+        // エラーの種類を判定
+        const is503Error = error.message.includes('503');
+        const isTemporary = is503Error || error.message.includes('timeout') || error.message.includes('UNAVAILABLE');
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: error.message,
+                  error_type: isTemporary ? 'temporary' : 'permanent',
+                  retry_recommended: isTemporary,
+                  message: '動画生成中にエラーが発生しました',
+                  troubleshooting: isTemporary
+                    ? '一時的なエラーです。数秒後に再試行してください。'
+                    : 'エラーの詳細を確認して、設定を見直してください。',
+                },
+                null,
+                2
+              ),
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // 動画完全生成ツール（音声→動画→QRコード一括生成）
+  server.registerTool(
+    'generate_complete_video',
+    {
+      title: '動画完全生成ツール',
+      description: 'テキストから音声生成・動画生成・ストレージアップロード・QRコード生成まで一括実行します（15言語対応）',
+      inputSchema: z.object({
+        text: z.string().describe('動画にするテキスト内容'),
+        language: z
+          .enum([
+            'ja', 'en', 'zh', 'zh-TW', 'ko', 'th', 'es', 'it', 'fr', 'de', 'ru', 'ms', 'id', 'vi', 'fil'
+          ])
+          .default('ja')
+          .describe('言語コード（15言語対応）'),
+        title: z.string().optional().describe('動画タイトル（省略時は自動生成）'),
+        description: z.string().optional().describe('動画説明文（省略時はデフォルト値）'),
+        tags: z.array(z.string()).optional().describe('動画タグ（配列）'),
+        is_public: z.boolean().default(true).describe('動画を公開するか'),
+        use_bgm: z.boolean().default(false).describe('BGMを使用するか'),
+        use_subtitles: z.boolean().default(true).describe('字幕を表示するか'),
+        use_vertical_video: z.boolean().default(false).describe('縦動画（1080x1920）にするか'),
+        image_urls: z.array(z.string()).optional().describe('背景画像URL（複数対応・将来拡張用）'),
+        mcp_user_id: z.string().default('38').describe('MCPユーザーID'),
+      }),
+    },
+    async (args, extra) => {
+      try {
+        const { text, language, title, description, tags, is_public, use_bgm, use_subtitles, use_vertical_video, image_urls, mcp_user_id } = args;
+
+        await server.sendLoggingMessage(
+          { level: 'info', data: 'Starting complete video generation: "' + text.substring(0, 50) + (text.length > 50 ? '...' : '') + '" (' + language + ')' },
+          extra.sessionId
+        );
+
+        const apiUrl = BASE_API_URL + '/mcp/generate-complete-video';
+        const requestBody = {
+          mcp_api_key: MCP_API_KEY,
+          text: text,
+          language: language,
+          title: title,
+          description: description,
+          tags: tags,
+          is_public: is_public,
+          use_bgm: use_bgm,
+          use_subtitles: use_subtitles,
+          use_vertical_video: use_vertical_video,
+          image_urls: image_urls,
+          mcp_user_id: mcp_user_id
+        };
+
+        console.log('[DEBUG] Complete Video API Request:', JSON.stringify(requestBody, null, 2));
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 120000);
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+          signal: controller.signal,
+        }).finally(() => clearTimeout(timeout));
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.log('[ERROR] Complete Video API:', response.status, errorText);
+          throw new Error('API request failed: ' + response.status + ' - ' + errorText);
+        }
+
+        const data = await response.json();
+        if (!data.success) {
+          throw new Error('動画生成に失敗: ' + JSON.stringify(data));
+        }
+
+        const r = data.data;
+        await server.sendLoggingMessage(
+          { level: 'info', data: 'Complete video succeeded! Project: ' + r.project_id + ', Short URL: ' + r.short_url },
+          extra.sessionId
+        );
+
+        const resultText = '動画生成完了！\n\n' +
+          'プロジェクトID: ' + r.project_id + '\n' +
+          'video_id: ' + r.video_id + '\n\n' +
+          '短縮URL: ' + r.short_url + '\n' +
+          '短縮コード: ' + r.short_code + '\n\n' +
+          '動画URL: ' + r.video_url + '\n' +
+          '音声URL: ' + r.audio_url + '\n\n' +
+          'タイトル: ' + r.title + '\n' +
+          '説明: ' + r.description + '\n' +
+          '言語: ' + r.language + '\n' +
+          '音声時間: ' + r.duration_seconds + '秒\n' +
+          'ファイルサイズ: ' + r.file_size + ' bytes\n' +
+          '画像枚数: ' + r.image_count + '枚\n\n' +
+          'QRコード: Base64データ（' + r.qr_code.length + '文字）\n\n' +
+          'スマートフォンでQRコードをスキャンすると動画が再生されます。';
+
+        return {
+          content: [
+            { type: 'text', text: resultText },
+            { type: 'image', data: r.qr_code.replace(/^data:image\/png;base64,/, ''), mimeType: 'image/png' }
+          ],
+          isError: false,
+        };
+      } catch (error) {
+        console.error('[ERROR] generate_complete_video failed:', error);
+        await server.sendLoggingMessage(
+          { level: 'error', data: 'Complete video generation failed: ' + error.message },
+          extra.sessionId
+        );
+
+        if (error.name === 'AbortError') {
+          return {
+            content: [{ type: 'text', text: '動画生成がタイムアウトしました（120秒超過）。処理は継続している可能性があります。\n\nエラー: ' + error.message }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{ type: 'text', text: '動画生成エラー: ' + error.message + '\n\nStack: ' + error.stack }],
+          isError: true,
         };
       }
     }
@@ -314,6 +650,9 @@ const createMcpServer = () => {
 
   return server;
 };
+
+// グローバルMCPサーバーインスタンス（全セッションで共有）
+const globalMcpServer = createMcpServer();
 
 /**
  * Expressアプリケーションのセットアップ
@@ -416,9 +755,8 @@ const mcpPostHandler = async (req, res) => {
         }
       };
 
-      // MCPサーバーに接続
-      const server = createMcpServer();
-      await server.connect(transport);
+      // グローバルMCPサーバーに接続
+      await globalMcpServer.connect(transport);
       await transport.handleRequest(req, res, req.body);
       return;
     } else if (sessionId && req.body && req.body.method === 'tools/call') {
@@ -457,7 +795,6 @@ const mcpPostHandler = async (req, res) => {
       };
 
       // MCPサーバーに接続
-      const server = createMcpServer();
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       return;
