@@ -8,6 +8,8 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js';
+import fs from 'fs';
+import path from 'path';
 
 // 環境変数の読み込み
 dotenv.config();
@@ -176,7 +178,7 @@ const createMcpServer = () => {
               finalStatus = status;
 
               // 音声完成を確認
-              if (status === 'audio_completed' && statusData.data.files?.audio) {
+              if ((status === 'audio_completed' || status === 'completed') && statusData.data.files?.audio) {
                 audioPath = statusData.data.files.audio;
                 audioFileUrl = `https://omotenashiqr.com/${audioPath}`;
                 completedStatusData = statusData;
@@ -320,45 +322,43 @@ const createMcpServer = () => {
 
           const imgBuf = await imgResp.arrayBuffer();
 
+          // TODO: 画像保存の恒久的な解決策が必要
+          // 現在の実装: MCPサーバーから直接プロジェクトフォルダに保存
+          // 将来の改善: 本体側のAPI拡張（project_id対応のアップロードエンドポイント）
+          // 課題: uploads/フォルダとproject/フォルダの二重管理
+          
           await server.sendLoggingMessage(
             {
               level: 'info',
-              data: `Default image downloaded, uploading to server...`,
+              data: `Saving image directly to project folder...`,
             },
             extra.sessionId
           );
 
-          // 画像をおもてなしQRサーバーにアップロード
-          const formData = new FormData();
-          const blob = new Blob([imgBuf], { type: 'image/jpeg' });
-          formData.append('file', blob, 'default_background.jpg');
-
-          const uploadUrl = `${BASE_API_URL}/upload/background`;
-          const uploadResp = await fetch(uploadUrl, {
-            method: 'POST',
-            body: formData,
-          });
-
-          if (!uploadResp.ok) {
-            const errorText = await uploadResp.text();
-            throw new Error(`Image upload failed: ${uploadResp.status} - ${errorText}`);
+          // プロジェクトフォルダに直接保存
+          const timestamp = Math.floor(Date.now() / 1000);
+          const filename = `${timestamp}_default_background.jpg`;
+          const projectPath = `/home/ubuntu/omotenashiqr_production/outputs/${project_id}`;
+          const filepath = `${projectPath}/${filename}`;
+          
+          // プロジェクトフォルダが存在することを確認
+          if (!fs.existsSync(projectPath)) {
+            throw new Error(`Project directory does not exist: ${projectPath}`);
           }
 
-          const uploadData = await uploadResp.json();
-          if (!uploadData.success) {
-            throw new Error(`Image upload error: ${JSON.stringify(uploadData)}`);
-          }
+          // バッファをファイルに書き込み
+          fs.writeFileSync(filepath, Buffer.from(imgBuf));
 
           uploadedImageInfo = {
             id: 'img_1',
-            file_name: uploadData.data.filename,
+            file_name: filename,
             original_name: 'default_background.jpg',
           };
 
           await server.sendLoggingMessage(
             {
               level: 'info',
-              data: `Image uploaded successfully: ${uploadData.data.filename}`,
+              data: `Image saved to project folder: ${filename}`,
             },
             extra.sessionId
           );
@@ -444,7 +444,7 @@ const createMcpServer = () => {
           const statusResp = await fetch(statusUrl);
           if (statusResp.ok) {
             const statusData = await statusResp.json();
-            if (statusData.success && statusData.data && statusData.data.status === 'video_completed' && statusData.data.files?.video) {
+            if (statusData.success && statusData.data && statusData.data.status === 'completed' && statusData.data.files?.video) {
               videoUrl = `https://omotenashiqr.com/${statusData.data.files.video}`;
               shortUrl = statusData.data.short_url || null;
               break;
@@ -518,6 +518,130 @@ const createMcpServer = () => {
               ),
             },
           ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // 動画完全生成ツール（音声→動画→QRコード一括生成）
+  server.registerTool(
+    'generate_complete_video',
+    {
+      title: '動画完全生成ツール',
+      description: 'テキストから音声生成・動画生成・ストレージアップロード・QRコード生成まで一括実行します（15言語対応）',
+      inputSchema: z.object({
+        text: z.string().describe('動画にするテキスト内容'),
+        language: z
+          .enum([
+            'ja', 'en', 'zh', 'zh-TW', 'ko', 'th', 'es', 'it', 'fr', 'de', 'ru', 'ms', 'id', 'vi', 'fil'
+          ])
+          .default('ja')
+          .describe('言語コード（15言語対応）'),
+        title: z.string().optional().describe('動画タイトル（省略時は自動生成）'),
+        description: z.string().optional().describe('動画説明文（省略時はデフォルト値）'),
+        tags: z.array(z.string()).optional().describe('動画タグ（配列）'),
+        is_public: z.boolean().default(true).describe('動画を公開するか'),
+        use_bgm: z.boolean().default(false).describe('BGMを使用するか'),
+        use_subtitles: z.boolean().default(true).describe('字幕を表示するか'),
+        use_vertical_video: z.boolean().default(false).describe('縦動画（1080x1920）にするか'),
+        image_urls: z.array(z.string()).optional().describe('背景画像URL（複数対応・将来拡張用）'),
+        mcp_user_id: z.string().default('38').describe('MCPユーザーID'),
+      }),
+    },
+    async (args, extra) => {
+      try {
+        const { text, language, title, description, tags, is_public, use_bgm, use_subtitles, use_vertical_video, image_urls, mcp_user_id } = args;
+
+        await server.sendLoggingMessage(
+          { level: 'info', data: 'Starting complete video generation: "' + text.substring(0, 50) + (text.length > 50 ? '...' : '') + '" (' + language + ')' },
+          extra.sessionId
+        );
+
+        const apiUrl = BASE_API_URL + '/mcp/generate-complete-video';
+        const requestBody = {
+          mcp_api_key: MCP_API_KEY,
+          text: text,
+          language: language,
+          title: title,
+          description: description,
+          tags: tags,
+          is_public: is_public,
+          use_bgm: use_bgm,
+          use_subtitles: use_subtitles,
+          use_vertical_video: use_vertical_video,
+          image_urls: image_urls,
+          mcp_user_id: mcp_user_id
+        };
+
+        console.log('[DEBUG] Complete Video API Request:', JSON.stringify(requestBody, null, 2));
+
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 120000);
+
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+          signal: controller.signal,
+        }).finally(() => clearTimeout(timeout));
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.log('[ERROR] Complete Video API:', response.status, errorText);
+          throw new Error('API request failed: ' + response.status + ' - ' + errorText);
+        }
+
+        const data = await response.json();
+        if (!data.success) {
+          throw new Error('動画生成に失敗: ' + JSON.stringify(data));
+        }
+
+        const r = data.data;
+        await server.sendLoggingMessage(
+          { level: 'info', data: 'Complete video succeeded! Project: ' + r.project_id + ', Short URL: ' + r.short_url },
+          extra.sessionId
+        );
+
+        const resultText = '動画生成完了！\n\n' +
+          'プロジェクトID: ' + r.project_id + '\n' +
+          'video_id: ' + r.video_id + '\n\n' +
+          '短縮URL: ' + r.short_url + '\n' +
+          '短縮コード: ' + r.short_code + '\n\n' +
+          '動画URL: ' + r.video_url + '\n' +
+          '音声URL: ' + r.audio_url + '\n\n' +
+          'タイトル: ' + r.title + '\n' +
+          '説明: ' + r.description + '\n' +
+          '言語: ' + r.language + '\n' +
+          '音声時間: ' + r.duration_seconds + '秒\n' +
+          'ファイルサイズ: ' + r.file_size + ' bytes\n' +
+          '画像枚数: ' + r.image_count + '枚\n\n' +
+          'QRコード: Base64データ（' + r.qr_code.length + '文字）\n\n' +
+          'スマートフォンでQRコードをスキャンすると動画が再生されます。';
+
+        return {
+          content: [
+            { type: 'text', text: resultText },
+            { type: 'image', data: r.qr_code.replace(/^data:image\/png;base64,/, ''), mimeType: 'image/png' }
+          ],
+          isError: false,
+        };
+      } catch (error) {
+        console.error('[ERROR] generate_complete_video failed:', error);
+        await server.sendLoggingMessage(
+          { level: 'error', data: 'Complete video generation failed: ' + error.message },
+          extra.sessionId
+        );
+
+        if (error.name === 'AbortError') {
+          return {
+            content: [{ type: 'text', text: '動画生成がタイムアウトしました（120秒超過）。処理は継続している可能性があります。\n\nエラー: ' + error.message }],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [{ type: 'text', text: '動画生成エラー: ' + error.message + '\n\nStack: ' + error.stack }],
           isError: true,
         };
       }
